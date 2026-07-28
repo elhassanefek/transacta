@@ -1,0 +1,8 @@
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS webhook_events;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS entries;
+DROP TABLE IF EXISTS transactions;
+DROP TABLE IF EXISTS accounts;
+DROP TABLE IF EXISTS tenants;
+DROP EXTENSION IF EXISTS pgcrypto;

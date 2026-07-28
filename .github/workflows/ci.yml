@@ -1,0 +1,97 @@
+name: Transacta CI/CD
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+jobs:
+  # -------------------------------------------------------------
+  # Job 1: Linting & Code Quality
+  # -------------------------------------------------------------
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.56.2
+
+  # -------------------------------------------------------------
+  # Job 2: Build & Integration Tests (With PostgreSQL)
+  # -------------------------------------------------------------
+  test:
+    name: Run Unit & Concurrency Tests
+    runs-on: ubuntu-latest
+
+    # Service container for Postgres tests
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: transacta
+          POSTGRES_PASSWORD: transacta_dev
+          POSTGRES_DB: transacta
+        ports:
+          - 5432:5432
+        # Ensure postgres is healthy before running tests
+        options: >-
+          --health-cmd pg_isready -U transacta
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      # Inject DB Connection details for tests
+      - name: Run Tests with Race Detector
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: transacta
+          DB_PASSWORD: transacta_dev
+          DB_NAME: transacta
+          DB_SSLMODE: disable
+
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+  # -------------------------------------------------------------
+  # Job 3: Verify Docker Build
+  # -------------------------------------------------------------
+  docker-build:
+    name: Verify Docker Image Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image (Dry Run)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: false # Set to true later when pushing to Docker Hub or GHCR
+          tags: transacta:latest
