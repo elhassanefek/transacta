@@ -47,7 +47,7 @@ jobs:
           - 5432:5432
         # Ensure postgres is healthy before running tests
         options: >-
-          --health-cmd pg_isready -U transacta
+          --health-cmd pg_isready 
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
