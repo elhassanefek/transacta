@@ -1,0 +1,5 @@
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (*database/sql.Rows).Close
+      - (*database/sql.DB).Close
