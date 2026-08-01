@@ -1,3 +1,5 @@
+name: transacta
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -16,6 +18,28 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # One-shot migration runner. Does NOT start with `docker compose up`
+  # (it's in the "tools" profile) — invoke it explicitly via the
+  # Makefile targets (make migrate-up / migrate-down / migrate-create).
+  migrate:
+    image: migrate/migrate:v4.17.1
+    container_name: transacta_migrate
+    profiles: ["tools"]
+    volumes:
+      - ../migrations:/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      [
+        "migrate",
+        "-path", "/migrations",
+        "-database", "postgres://transacta:transacta_dev@postgres:5432/transacta?sslmode=disable"
+      ]
+    # default command if you run `docker compose --profile tools run migrate`
+    # with no extra args; Makefile overrides this per target.
+    command: ["up"]
 
 volumes:
   pgdata:
