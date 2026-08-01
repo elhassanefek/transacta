@@ -90,15 +90,18 @@ func (r *Repository) LockAccountsForUpdate(ctx context.Context, tx *sql.Tx, tena
 	for rows.Next() {
 		var a Account
 		if err := rows.Scan(&a.ID, &a.TenantID, &a.Name, &a.CreatedAt); err != nil {
+		_:
 			rows.Close()
 			return nil, fmt.Errorf("ledger: scan locked account: %w", err)
 		}
 		out[a.ID] = &a
 	}
 	if err := rows.Err(); err != nil {
+	_:
 		rows.Close()
 		return nil, fmt.Errorf("ledger: lock accounts: %w", err)
 	}
+_:
 	rows.Close()
 
 	for _, id := range sorted {
@@ -119,7 +122,7 @@ func (r *Repository) LockAccountsForUpdate(ctx context.Context, tx *sql.Tx, tena
 	if err != nil {
 		return nil, fmt.Errorf("ledger: sum balances: %w", err)
 	}
-	defer brows.Close()
+	defer func() { _ = brows.Close() }()
 	for brows.Next() {
 		var accID uuid.UUID
 		var sum int64
@@ -185,7 +188,7 @@ func (r *Repository) GetTransaction(ctx context.Context, q DBTX, tenantID, id uu
 	if err != nil {
 		return nil, nil, fmt.Errorf("ledger: get entries: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []*Entry
 	for rows.Next() {
