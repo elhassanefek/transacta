@@ -90,19 +90,19 @@ func (r *Repository) LockAccountsForUpdate(ctx context.Context, tx *sql.Tx, tena
 	for rows.Next() {
 		var a Account
 		if err := rows.Scan(&a.ID, &a.TenantID, &a.Name, &a.CreatedAt); err != nil {
-		_:
-			rows.Close()
+			_ =
+				rows.Close()
 			return nil, fmt.Errorf("ledger: scan locked account: %w", err)
 		}
 		out[a.ID] = &a
 	}
 	if err := rows.Err(); err != nil {
-	_:
-		rows.Close()
+		_ =
+			rows.Close()
 		return nil, fmt.Errorf("ledger: lock accounts: %w", err)
 	}
-_:
-	rows.Close()
+	_ =
+		rows.Close()
 
 	for _, id := range sorted {
 		if _, ok := out[id]; !ok {
