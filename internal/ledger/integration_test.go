@@ -53,10 +53,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	t.Cleanup(func() {
-	_:
-		db.Close()
-	})
+	t.Cleanup(func() { _ = db.Close() })
 
 	if err := db.PingContext(ctx); err != nil {
 		t.Fatalf("ping db: %v", err)
