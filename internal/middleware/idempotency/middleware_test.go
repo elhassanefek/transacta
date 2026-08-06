@@ -64,19 +64,27 @@ func (f *fakeStore) ClaimOrGet(_ context.Context, tenantID uuid.UUID, key, reque
 	return rec, true, nil
 }
 
-func (f *fakeStore) Complete(_ context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) error {
+func (f *fakeStore) Complete(_ context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration, claimedAt time.Time) error {
 	f.completeCalls = append(f.completeCalls, completeCall{tenantID, key, responseCode, responseBody})
 	if f.completeFailuresRemaining > 0 {
 		f.completeFailuresRemaining--
 		return errors.New("simulated transient failure")
 	}
 	sk := f.storeKey(tenantID, key)
-	if rec, ok := f.records[sk]; ok {
-		rec.Status = StatusCompleted
-		rec.ResponseCode = &responseCode
-		rec.ResponseBody = responseBody
-		rec.ExpiresAt = time.Now().Add(retentionTTL)
+	rec, ok := f.records[sk]
+	if !ok {
+		return ErrClaimSuperseded
 	}
+	// Fencing check, mirroring the real repository's `AND created_at = $6`:
+	// if the row's claim epoch no longer matches what the caller believes
+	// it owns, someone else has since reclaimed it -- refuse to overwrite.
+	if !rec.CreatedAt.Equal(claimedAt) {
+		return ErrClaimSuperseded
+	}
+	rec.Status = StatusCompleted
+	rec.ResponseCode = &responseCode
+	rec.ResponseBody = responseBody
+	rec.ExpiresAt = time.Now().Add(retentionTTL)
 	return nil
 }
 
@@ -247,7 +255,8 @@ func TestCompleteWithRetry_SucceedsAfterTransientFailures(t *testing.T) {
 
 	// Seed a real claimed record first, same as the middleware would have
 	// done before calling completeWithRetry.
-	if _, claimed, err := store.ClaimOrGet(context.Background(), tenantID, "key-1", "hash-1", time.Hour); err != nil || !claimed {
+	claimedRec, claimed, err := store.ClaimOrGet(context.Background(), tenantID, "key-1", "hash-1", time.Hour)
+	if err != nil || !claimed {
 		t.Fatalf("setup claim: claimed=%v err=%v", claimed, err)
 	}
 	store.completeFailuresRemaining = 2 // fail twice, succeed on 3rd attempt
@@ -255,7 +264,7 @@ func TestCompleteWithRetry_SucceedsAfterTransientFailures(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`), time.Hour)
+	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`), time.Hour, claimedRec.CreatedAt)
 
 	if len(store.completeCalls) != 3 {
 		t.Fatalf("Complete called %d times, want 3 (2 failures + 1 success)", len(store.completeCalls))
@@ -281,7 +290,7 @@ func TestCompleteWithRetry_LogsErrorOnExhaustion(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`), time.Hour)
+	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`), time.Hour, time.Now())
 
 	if len(store.completeCalls) != completeRetryAttempts {
 		t.Fatalf("Complete called %d times, want %d (all attempts exhausted)", len(store.completeCalls), completeRetryAttempts)
@@ -340,5 +349,55 @@ func TestMiddleware_CrashRecovery_ShortLeaseAllowsRetryAfterAbandonment(t *testi
 	}
 	if rec2.Body.String() != `{"id":"txn-1"}` {
 		t.Fatalf("post-lease retry body = %q, want the handler to have actually run", rec2.Body.String())
+	}
+}
+
+// TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim
+// simulates exactly the race a reader flagged: Server A claims a key,
+// its lease expires while it's still slowly working, Server B reclaims
+// and finishes first, and then Server A finally finishes and tries to
+// persist its own (stale) result. Without the created_at fencing check,
+// A's write would silently overwrite B's already-cached response. With
+// it, A's write is refused and B's result survives untouched.
+func TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim(t *testing.T) {
+	store := newFakeStore()
+	tenantID := uuid.New()
+	ctx := context.Background()
+
+	// Server A claims first.
+	recA, claimed, err := store.ClaimOrGet(ctx, tenantID, "key-1", "hash-1", time.Millisecond)
+	if err != nil || !claimed {
+		t.Fatalf("A's claim: claimed=%v err=%v", claimed, err)
+	}
+
+	// Simulate A's lease expiring, then Server B reclaiming.
+	time.Sleep(5 * time.Millisecond)
+	recB, claimed, err := store.ClaimOrGet(ctx, tenantID, "key-1", "hash-1", time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("B's reclaim: claimed=%v err=%v", claimed, err)
+	}
+	if recA.CreatedAt.Equal(recB.CreatedAt) {
+		t.Fatal("expected B's reclaim to produce a different created_at than A's original claim")
+	}
+
+	// B finishes first and persists its result.
+	if err := store.Complete(ctx, tenantID, "key-1", 200, []byte(`{"winner":"B"}`), time.Hour, recB.CreatedAt); err != nil {
+		t.Fatalf("B's Complete: %v", err)
+	}
+
+	// A finally wakes up and tries to persist its own, stale result.
+	err = store.Complete(ctx, tenantID, "key-1", 500, []byte(`{"winner":"A"}`), time.Hour, recA.CreatedAt)
+	if !errors.Is(err, ErrClaimSuperseded) {
+		t.Fatalf("A's stale Complete() error = %v, want ErrClaimSuperseded", err)
+	}
+
+	// B's result must be untouched.
+	sk := store.storeKey(tenantID, "key-1")
+	final := store.records[sk]
+	if final.ResponseCode == nil || *final.ResponseCode != 200 {
+		t.Fatalf("final response code = %v, want 200 (B's result must survive A's stale write)", final.ResponseCode)
+	}
+	if string(final.ResponseBody) != `{"winner":"B"}` {
+		t.Fatalf("final response body = %q, want B's result -- A's stale write must not have clobbered it", final.ResponseBody)
 	}
 }

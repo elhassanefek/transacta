@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -34,7 +35,7 @@ const (
 
 type Store interface {
 	ClaimOrGet(ctx context.Context, tenantID uuid.UUID, key, requestHash string, leaseTTL time.Duration) (*Record, bool, error)
-	Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) error
+Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration, claimedAt time.Time) error
 }
 
 // Option configures Middleware's optional behavior.
@@ -103,23 +104,28 @@ func Middleware(store Store, retentionTTL time.Duration, opts ...Option) func(ht
 			next.ServeHTTP(rw, r)
 
 			
-			completeWithRetry(context.Background(), store, o.logger, tenantID, key, rw.statusCode, rw.body.Bytes(), retentionTTL)
+			completeWithRetry(context.Background(), store, o.logger, tenantID, key, rw.statusCode, rw.body.Bytes(), retentionTTL, rec.CreatedAt)
 		})
 	}
 }
 
 
-func completeWithRetry(ctx context.Context, store Store, logger *slog.Logger, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) {
+func completeWithRetry(ctx context.Context, store Store, logger *slog.Logger, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration, claimedAt time.Time) {
 	var lastErr error
 	for attempt := 1; attempt <= completeRetryAttempts; attempt++ {
-		if err := store.Complete(ctx, tenantID, key, responseCode, responseBody, retentionTTL); err != nil {
-			lastErr = err
-			logger.Warn("idempotency: failed to persist completed record, retrying",
-				"tenant_id", tenantID, "key", key, "attempt", attempt, "error", err)
-			time.Sleep(time.Duration(attempt) * completeRetryBackoff)
-			continue
+		err := store.Complete(ctx, tenantID, key, responseCode, responseBody, retentionTTL, claimedAt)
+		if err == nil {
+			return
 		}
-		return
+		if errors.Is(err, ErrClaimSuperseded) {
+			logger.Info("idempotency: claim was superseded before this result could be persisted, discarding",
+				"tenant_id", tenantID, "key", key)
+			return
+		}
+		lastErr = err
+		logger.Warn("idempotency: failed to persist completed record, retrying",
+			"tenant_id", tenantID, "key", key, "attempt", attempt, "error", err)
+		time.Sleep(time.Duration(attempt) * completeRetryBackoff)
 	}
 	logger.Error("idempotency: exhausted retries persisting completed record -- "+
 		"key remains stuck at 'processing' until its processing lease expires",

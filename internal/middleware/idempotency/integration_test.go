@@ -8,6 +8,7 @@ package idempotency
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -163,12 +164,12 @@ func TestRepository_CompleteThenReplay(t *testing.T) {
 	repo := NewRepository(db)
 	tenantID := mustCreateTenant(t, db)
 
-	_, claimed, err := repo.ClaimOrGet(ctx, tenantID, "key-1", "hash-1", time.Hour)
+	claimedRec, claimed, err := repo.ClaimOrGet(ctx, tenantID, "key-1", "hash-1", time.Hour)
 	if err != nil || !claimed {
 		t.Fatalf("initial claim: claimed=%v err=%v", claimed, err)
 	}
 
-	if err := repo.Complete(ctx, tenantID, "key-1", 201, []byte(`{"id":"txn-1"}`), time.Hour); err != nil {
+	if err := repo.Complete(ctx, tenantID, "key-1", 201, []byte(`{"id":"txn-1"}`), time.Hour, claimedRec.CreatedAt); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 
@@ -228,5 +229,49 @@ func TestClaimOrGet_AbandonedProcessingClaimReclaimableAfterShortLease(t *testin
 	}
 	if rec.RequestHash != "hash-2" {
 		t.Fatalf("reclaimed record hash = %q, want %q", rec.RequestHash, "hash-2")
+	}
+}
+
+// TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim
+// proves the same scenario as its unit-test counterpart, but against real
+// Postgres: a stale writer's completion, carrying an outdated created_at
+// fencing token, must be refused once another server has reclaimed the
+// key -- not silently overwrite the newer claim's result.
+func TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewRepository(db)
+	tenantID := mustCreateTenant(t, db)
+
+	recA, claimed, err := repo.ClaimOrGet(ctx, tenantID, "key-1", "hash-1", time.Millisecond)
+	if err != nil || !claimed {
+		t.Fatalf("A's claim: claimed=%v err=%v", claimed, err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	recB, claimed, err := repo.ClaimOrGet(ctx, tenantID, "key-1", "hash-1", time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("B's reclaim: claimed=%v err=%v", claimed, err)
+	}
+
+	if err := repo.Complete(ctx, tenantID, "key-1", 200, []byte(`{"winner":"B"}`), time.Hour, recB.CreatedAt); err != nil {
+		t.Fatalf("B's complete: %v", err)
+	}
+
+	err = repo.Complete(ctx, tenantID, "key-1", 500, []byte(`{"winner":"A"}`), time.Hour, recA.CreatedAt)
+	if !errors.Is(err, ErrClaimSuperseded) {
+		t.Fatalf("A's stale complete error = %v, want ErrClaimSuperseded", err)
+	}
+
+	final, err := repo.Get(ctx, tenantID, "key-1")
+	if err != nil {
+		t.Fatalf("final get: %v", err)
+	}
+	if final.ResponseCode == nil || *final.ResponseCode != 200 {
+		t.Fatalf("final response code = %v, want 200 (B's result must survive)", final.ResponseCode)
+	}
+	if string(final.ResponseBody) != `{"winner":"B"}` {
+		t.Fatalf("final response body = %q, want B's result", final.ResponseBody)
 	}
 }

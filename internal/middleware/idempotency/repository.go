@@ -71,14 +71,22 @@ func (r *Repository) Get(ctx context.Context, tenantID uuid.UUID, key string) (*
 }
 
 
-func (r *Repository) Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) error {
+func (r *Repository) Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration, claimedAt time.Time) error {
 	expiresAt := time.Now().UTC().Add(retentionTTL)
 	const query = `
 		UPDATE idempotency_keys
 		SET status = 'completed', response_code = $3, response_body = $4, expires_at = $5
-		WHERE tenant_id = $1 AND key = $2`
-	if _, err := r.db.ExecContext(ctx, query, tenantID, key, responseCode, responseBody, expiresAt); err != nil {
+		WHERE tenant_id = $1 AND key = $2 AND created_at = $6`
+	res, err := r.db.ExecContext(ctx, query, tenantID, key, responseCode, responseBody, expiresAt, claimedAt)
+	if err != nil {
 		return fmt.Errorf("idempotency: complete: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("idempotency: complete: %w", err)
+	}
+	if n == 0 {
+		return ErrClaimSuperseded
 	}
 	return nil
 }
