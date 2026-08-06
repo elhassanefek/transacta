@@ -168,7 +168,7 @@ func TestRepository_CompleteThenReplay(t *testing.T) {
 		t.Fatalf("initial claim: claimed=%v err=%v", claimed, err)
 	}
 
-	if err := repo.Complete(ctx, tenantID, "key-1", 201, []byte(`{"id":"txn-1"}`)); err != nil {
+	if err := repo.Complete(ctx, tenantID, "key-1", 201, []byte(`{"id":"txn-1"}`), time.Hour); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 
@@ -187,5 +187,46 @@ func TestRepository_CompleteThenReplay(t *testing.T) {
 	}
 	if string(rec.ResponseBody) != `{"id":"txn-1"}` {
 		t.Fatalf("response body = %q, want %q", rec.ResponseBody, `{"id":"txn-1"}`)
+	}
+}
+
+// TestClaimOrGet_AbandonedProcessingClaimReclaimableAfterShortLease proves
+// the crash-recovery scenario against real Postgres: a claim that's never
+// completed (simulating a crashed worker) becomes reclaimable once its
+// short processing lease elapses, without needing to wait out a long
+// replay-retention window.
+func TestClaimOrGet_AbandonedProcessingClaimReclaimableAfterShortLease(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewRepository(db)
+	tenantID := mustCreateTenant(t, db)
+
+	const shortLease = 200 * time.Millisecond
+
+	_, claimed, err := repo.ClaimOrGet(ctx, tenantID, "crash-key", "hash-1", shortLease)
+	if err != nil || !claimed {
+		t.Fatalf("initial claim: claimed=%v err=%v", claimed, err)
+	}
+
+	// Immediately: still within the lease, must not be reclaimable.
+	_, claimed, err = repo.ClaimOrGet(ctx, tenantID, "crash-key", "hash-1", shortLease)
+	if err != nil {
+		t.Fatalf("immediate re-check: %v", err)
+	}
+	if claimed {
+		t.Fatal("expected claim to still be live within the lease window")
+	}
+
+	time.Sleep(shortLease * 3)
+
+	rec, claimed, err := repo.ClaimOrGet(ctx, tenantID, "crash-key", "hash-2", time.Hour)
+	if err != nil {
+		t.Fatalf("post-lease claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected abandoned claim to be reclaimable after its lease expired")
+	}
+	if rec.RequestHash != "hash-2" {
+		t.Fatalf("reclaimed record hash = %q, want %q", rec.RequestHash, "hash-2")
 	}
 }

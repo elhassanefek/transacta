@@ -64,7 +64,7 @@ func (f *fakeStore) ClaimOrGet(_ context.Context, tenantID uuid.UUID, key, reque
 	return rec, true, nil
 }
 
-func (f *fakeStore) Complete(_ context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte) error {
+func (f *fakeStore) Complete(_ context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) error {
 	f.completeCalls = append(f.completeCalls, completeCall{tenantID, key, responseCode, responseBody})
 	if f.completeFailuresRemaining > 0 {
 		f.completeFailuresRemaining--
@@ -75,6 +75,7 @@ func (f *fakeStore) Complete(_ context.Context, tenantID uuid.UUID, key string, 
 		rec.Status = StatusCompleted
 		rec.ResponseCode = &responseCode
 		rec.ResponseBody = responseBody
+		rec.ExpiresAt = time.Now().Add(retentionTTL)
 	}
 	return nil
 }
@@ -254,7 +255,7 @@ func TestCompleteWithRetry_SucceedsAfterTransientFailures(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`))
+	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`), time.Hour)
 
 	if len(store.completeCalls) != 3 {
 		t.Fatalf("Complete called %d times, want 3 (2 failures + 1 success)", len(store.completeCalls))
@@ -280,7 +281,7 @@ func TestCompleteWithRetry_LogsErrorOnExhaustion(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`))
+	completeWithRetry(context.Background(), store, logger, tenantID, "key-1", 201, []byte(`{"ok":true}`), time.Hour)
 
 	if len(store.completeCalls) != completeRetryAttempts {
 		t.Fatalf("Complete called %d times, want %d (all attempts exhausted)", len(store.completeCalls), completeRetryAttempts)
@@ -288,7 +289,56 @@ func TestCompleteWithRetry_LogsErrorOnExhaustion(t *testing.T) {
 	if !strings.Contains(logBuf.String(), "level=ERROR") {
 		t.Fatal("expected an ERROR log when all retries are exhausted -- this must not fail silently")
 	}
-	if !strings.Contains(logBuf.String(), "silently reclaimable") {
-		t.Fatal("expected the error log to explain the actual risk (silent reclaim after TTL), not just 'failed'")
+	if !strings.Contains(logBuf.String(), "processing lease") {
+		t.Fatal("expected the error log to explain the actual risk (stuck until lease expires), not just 'failed'")
+	}
+}
+
+// TestMiddleware_CrashRecovery_ShortLeaseAllowsRetryAfterAbandonment
+// simulates a server crashing after claiming a key but before completing
+// it: the first "request" (a raw ClaimOrGet, standing in for a handler
+// that started and never finished) should block a retry with 409 while
+// its lease is still live, but a retry *after* the lease expires should
+// succeed -- proving recovery doesn't require waiting out the full
+// replay-retention window.
+func TestMiddleware_CrashRecovery_ShortLeaseAllowsRetryAfterAbandonment(t *testing.T) {
+	store := newFakeStore()
+	tenantID := uuid.New()
+	const shortLease = 50 * time.Millisecond
+
+	hash := requestHash(http.MethodPost, "/transfers", []byte(`{"amount":100}`))
+
+	// Simulate a crashed request: claimed, never completed.
+	_, claimed, err := store.ClaimOrGet(context.Background(), tenantID, "key-1", hash, shortLease)
+	if err != nil || !claimed {
+		t.Fatalf("initial claim: claimed=%v err=%v", claimed, err)
+	}
+
+	mw := Middleware(store, time.Hour, WithProcessingLease(shortLease))(
+		testHandler(http.StatusCreated, `{"id":"txn-1"}`),
+	)
+
+	// Immediately: still within the lease, must be rejected as in-flight.
+	req1 := withTenant(httptest.NewRequest(http.MethodPost, "/transfers", strings.NewReader(`{"amount":100}`)), tenantID)
+	req1.Header.Set(HeaderKey, "key-1")
+	rec1 := httptest.NewRecorder()
+	mw.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusConflict {
+		t.Fatalf("immediate retry status = %d, want %d (still within lease)", rec1.Code, http.StatusConflict)
+	}
+
+	// Wait past the lease -- simulating "enough time passed that we
+	// assume the crashed worker isn't coming back."
+	time.Sleep(shortLease * 3)
+
+	req2 := withTenant(httptest.NewRequest(http.MethodPost, "/transfers", strings.NewReader(`{"amount":100}`)), tenantID)
+	req2.Header.Set(HeaderKey, "key-1")
+	rec2 := httptest.NewRecorder()
+	mw.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("post-lease retry status = %d, want %d (abandoned claim should be reclaimable)", rec2.Code, http.StatusCreated)
+	}
+	if rec2.Body.String() != `{"id":"txn-1"}` {
+		t.Fatalf("post-lease retry body = %q, want the handler to have actually run", rec2.Body.String())
 	}
 }

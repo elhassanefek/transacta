@@ -20,9 +20,9 @@ func NewRepository(db *sql.DB) *Repository {
 }
 
 
-func (r *Repository) ClaimOrGet(ctx context.Context, tenantID uuid.UUID, key, requestHash string, ttl time.Duration) (*Record, bool, error) {
+func (r *Repository) ClaimOrGet(ctx context.Context, tenantID uuid.UUID, key, requestHash string, leaseTTL time.Duration) (*Record, bool, error) {
 	now := time.Now().UTC()
-	expiresAt := now.Add(ttl)
+	expiresAt := now.Add(leaseTTL)
 
 	const claimQuery = `
 		INSERT INTO idempotency_keys (tenant_id, key, request_hash, status, created_at, expires_at)
@@ -45,7 +45,9 @@ func (r *Repository) ClaimOrGet(ctx context.Context, tenantID uuid.UUID, key, re
 		return nil, false, fmt.Errorf("idempotency: claim: %w", err)
 	}
 
-	
+	// Zero rows back means a live (non-expired) record already exists and
+	// the WHERE guard correctly refused to touch it. Fetch it so the
+	// caller can decide what to do with it.
 	existing, err := r.Get(ctx, tenantID, key)
 	if err != nil {
 		return nil, false, err
@@ -69,12 +71,13 @@ func (r *Repository) Get(ctx context.Context, tenantID uuid.UUID, key string) (*
 }
 
 
-func (r *Repository) Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte) error {
+func (r *Repository) Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) error {
+	expiresAt := time.Now().UTC().Add(retentionTTL)
 	const query = `
 		UPDATE idempotency_keys
-		SET status = 'completed', response_code = $3, response_body = $4
+		SET status = 'completed', response_code = $3, response_body = $4, expires_at = $5
 		WHERE tenant_id = $1 AND key = $2`
-	if _, err := r.db.ExecContext(ctx, query, tenantID, key, responseCode, responseBody); err != nil {
+	if _, err := r.db.ExecContext(ctx, query, tenantID, key, responseCode, responseBody, expiresAt); err != nil {
 		return fmt.Errorf("idempotency: complete: %w", err)
 	}
 	return nil

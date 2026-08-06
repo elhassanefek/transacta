@@ -21,6 +21,10 @@ const HeaderKey = "Idempotency-Key"
 
 const DefaultTTL = 24 * time.Hour
 
+// DefaultProcessingLease is how long a claimed-but-not-yet-completed
+
+const DefaultProcessingLease = 30 * time.Second
+
 
 const (
 	completeRetryAttempts = 3
@@ -29,15 +33,16 @@ const (
 
 
 type Store interface {
-	ClaimOrGet(ctx context.Context, tenantID uuid.UUID, key, requestHash string, ttl time.Duration) (*Record, bool, error)
-	Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte) error
+	ClaimOrGet(ctx context.Context, tenantID uuid.UUID, key, requestHash string, leaseTTL time.Duration) (*Record, bool, error)
+	Complete(ctx context.Context, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) error
 }
 
 // Option configures Middleware's optional behavior.
 type Option func(*options)
 
 type options struct {
-	logger *slog.Logger
+	logger          *slog.Logger
+	processingLease time.Duration
 }
 
 
@@ -46,11 +51,16 @@ func WithLogger(l *slog.Logger) Option {
 }
 
 
-func Middleware(store Store, ttl time.Duration, opts ...Option) func(http.Handler) http.Handler {
-	if ttl <= 0 {
-		ttl = DefaultTTL
+func WithProcessingLease(d time.Duration) Option {
+	return func(o *options) { o.processingLease = d }
+}
+
+
+func Middleware(store Store, retentionTTL time.Duration, opts ...Option) func(http.Handler) http.Handler {
+	if retentionTTL <= 0 {
+		retentionTTL = DefaultTTL
 	}
-	o := options{logger: slog.Default()}
+	o := options{logger: slog.Default(), processingLease: DefaultProcessingLease}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -78,7 +88,7 @@ func Middleware(store Store, ttl time.Duration, opts ...Option) func(http.Handle
 
 			hash := requestHash(r.Method, r.URL.Path, bodyBytes)
 
-			rec, claimed, err := store.ClaimOrGet(r.Context(), tenantID, key, hash, ttl)
+			rec, claimed, err := store.ClaimOrGet(r.Context(), tenantID, key, hash, o.processingLease)
 			if err != nil {
 				http.Error(w, "idempotency check failed", http.StatusInternalServerError)
 				return
@@ -92,21 +102,17 @@ func Middleware(store Store, ttl time.Duration, opts ...Option) func(http.Handle
 			rw := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 			next.ServeHTTP(rw, r)
 
-			// The response has already been sent to the client at this
-			// point. If the handler mutated real state (e.g. moved
-			// money), failing to persist "completed" here is not
-			// cosmetic: this record's status stays 'processing', which
-			// blocks retries with a 409 in the short term 
-			completeWithRetry(context.Background(), store, o.logger, tenantID, key, rw.statusCode, rw.body.Bytes())
+			
+			completeWithRetry(context.Background(), store, o.logger, tenantID, key, rw.statusCode, rw.body.Bytes(), retentionTTL)
 		})
 	}
 }
 
 
-func completeWithRetry(ctx context.Context, store Store, logger *slog.Logger, tenantID uuid.UUID, key string, responseCode int, responseBody []byte) {
+func completeWithRetry(ctx context.Context, store Store, logger *slog.Logger, tenantID uuid.UUID, key string, responseCode int, responseBody []byte, retentionTTL time.Duration) {
 	var lastErr error
 	for attempt := 1; attempt <= completeRetryAttempts; attempt++ {
-		if err := store.Complete(ctx, tenantID, key, responseCode, responseBody); err != nil {
+		if err := store.Complete(ctx, tenantID, key, responseCode, responseBody, retentionTTL); err != nil {
 			lastErr = err
 			logger.Warn("idempotency: failed to persist completed record, retrying",
 				"tenant_id", tenantID, "key", key, "attempt", attempt, "error", err)
@@ -116,13 +122,11 @@ func completeWithRetry(ctx context.Context, store Store, logger *slog.Logger, te
 		return
 	}
 	logger.Error("idempotency: exhausted retries persisting completed record -- "+
-		"key remains stuck at 'processing' and will become silently reclaimable once its TTL expires",
+		"key remains stuck at 'processing' until its processing lease expires",
 		"tenant_id", tenantID, "key", key, "error", lastErr)
 }
 
-// handleExisting decides what to do when ClaimOrGet finds a live record
-// instead of granting a fresh claim: reject a payload mismatch, reject an
-// in-flight duplicate, or replay a completed response verbatim.
+
 func handleExisting(w http.ResponseWriter, rec *Record, hash string) {
 	if rec.RequestHash != hash {
 		http.Error(w, ErrKeyReused.Error(), http.StatusUnprocessableEntity)
@@ -149,9 +153,7 @@ func requestHash(method, path string, body []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// responseRecorder captures the downstream handler's status code and body
-// so it can be cached for future replays, while still writing through to
-// the real client in real time 
+
 type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
