@@ -181,6 +181,9 @@ func (s *Service) Logout(ctx context.Context, rawRefreshToken string) error {
 	return s.repo.RevokeRefreshToken(ctx, s.repo.db, existing.ID)
 }
 
+func (s *Service) GetUserPermissions(ctx context.Context, tenantID, userID uuid.UUID) ([]string, error) {
+	return s.repo.GetUserPermissions(ctx, s.repo.db, tenantID, userID)
+}
 
 func (s *Service) ValidateAccessToken(tokenString string) (*Claims, error) {
 	claims := &Claims{}

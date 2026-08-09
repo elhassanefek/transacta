@@ -48,14 +48,14 @@ func (r *Repository) GetRoleByName(ctx context.Context, q DBTX, name string) (*R
 }
 
 
-func (r *Repository) GetUserPermissions(ctx context.Context, q DBTX, userID uuid.UUID) ([]string, error) {
+func (r *Repository) GetUserPermissions(ctx context.Context, q DBTX, tenantID, userID uuid.UUID) ([]string, error) {
 	const query = `
 		SELECT p.name
 		FROM users u
 		JOIN role_permissions rp ON rp.role_id = u.role_id
 		JOIN permissions p ON p.id = rp.permission_id
-		WHERE u.id = $1`
-	rows, err := q.QueryContext(ctx, query, userID)
+		WHERE u.id = $1 AND u.tenant_id = $2`
+	rows, err := q.QueryContext(ctx, query, userID, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("auth: get user permissions: %w", err)
 	}

@@ -267,7 +267,7 @@ func TestRepository_GetUserPermissions_MatchesSeededRoleGrants(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	perms, err := repo.GetUserPermissions(ctx, db, user.ID)
+	perms, err := repo.GetUserPermissions(ctx, db, tenantID, user.ID)
 	if err != nil {
 		t.Fatalf("GetUserPermissions: %v", err)
 	}
