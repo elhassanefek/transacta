@@ -16,7 +16,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/elhassanefek/transacta/internal/auth"
 	"github.com/elhassanefek/transacta/internal/ledger"
+	authmw "github.com/elhassanefek/transacta/internal/middleware/auth"
+	"github.com/elhassanefek/transacta/internal/middleware/idempotency"
+	"github.com/elhassanefek/transacta/internal/tenants"
 )
 
 func main() {
@@ -39,17 +43,44 @@ func main() {
 	}
 	logger.Info("connected to database", "host", cfg.DBHost, "name", cfg.DBName)
 
-	repo := ledger.NewRepository(db)
-	svc := ledger.NewService(repo)
-	_ = svc // wired for future handlers; M2 exposes no ledger HTTP routes yet
+	if cfg.JWTSecret == "" {
+		logger.Error("JWT_SECRET is not set -- refusing to start with an unsigned/insecure JWT signing key")
+		os.Exit(1)
+	}
+
+	ledgerRepo := ledger.NewRepository(db)
+	ledgerSvc := ledger.NewService(ledgerRepo)
+
+	idemRepo := idempotency.NewRepository(db)
+
+	authRepo := auth.NewRepository(db)
+	authSvc := auth.NewService(authRepo, []byte(cfg.JWTSecret))
+
+	tenantRepo := tenants.NewRepository(db)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 
 	r.Get("/healthz", healthHandler(db))
+
+	r.Route("/v1", func(r chi.Router) {
+		
+		r.With(requireTenantAPIKey(tenantRepo, db)).Post("/auth/register", registerHandler(authSvc, authRepo, db))
+
+		
+		r.Post("/auth/login", loginHandler(authSvc))
+		r.Post("/auth/refresh", refreshHandler(authSvc))
+		r.Post("/auth/logout", logoutHandler(authSvc))
+
+		
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "transactions:write"),
+			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
+		).Post("/transfers", transferHandler(ledgerSvc))
+	})
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -78,8 +109,6 @@ func main() {
 	}
 }
 
-// healthHandler reports 200 only if the database is actually reachable --
-// a health check that doesn't check the DB isn't a health check.
 func healthHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
@@ -94,8 +123,7 @@ func healthHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-// config holds the same DB_* env vars the CI workflow's test job already
-// sets, plus PORT. No config library pulled in for five env vars.
+
 type config struct {
 	DBHost     string
 	DBPort     string
@@ -104,6 +132,7 @@ type config struct {
 	DBName     string
 	DBSSLMode  string
 	Port       string
+	JWTSecret  string
 }
 
 func loadConfig() config {
@@ -115,6 +144,7 @@ func loadConfig() config {
 		DBName:     getenv("DB_NAME", "transacta"),
 		DBSSLMode:  getenv("DB_SSLMODE", "disable"),
 		Port:       getenv("PORT", "8080"),
+		JWTSecret:  getenv("JWT_SECRET", ""),
 	}
 }
 
