@@ -23,6 +23,7 @@ import (
 	"github.com/elhassanefek/transacta/internal/tenants"
 )
 
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -66,20 +67,59 @@ func main() {
 	r.Get("/healthz", healthHandler(db))
 
 	r.Route("/v1", func(r chi.Router) {
-		
+		// Registration is gated by the tenant's own API key -- proving
+		// "I'm allowed to provision users for this tenant," not "I'm
+		// already a user of it" (there's no user yet).
 		r.With(requireTenantAPIKey(tenantRepo, db)).Post("/auth/register", registerHandler(authSvc, authRepo, db))
 
-		
+		// Login/refresh/logout are public: the credential being checked
+		// IS the request body (password, or the refresh token itself).
 		r.Post("/auth/login", loginHandler(authSvc))
 		r.Post("/auth/refresh", refreshHandler(authSvc))
 		r.Post("/auth/logout", logoutHandler(authSvc))
 
-		
+		// Mutating ledger operations: authenticate (JWT) -> authorize
+		// (RBAC) -> guard against duplicate execution (idempotency) ->
+		// only then does the handler run.
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "accounts:write"),
+			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
+		).Post("/accounts", createAccountHandler(ledgerSvc))
+
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "accounts:read"),
+		).Get("/accounts/{id}", getAccountHandler(ledgerSvc))
+
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "transactions:read"),
+		).Get("/transactions/{id}", getTransactionHandler(ledgerSvc))
+
 		r.With(
 			authmw.Middleware(authSvc),
 			authmw.RequirePermission(authSvc, "transactions:write"),
 			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
 		).Post("/transfers", transferHandler(ledgerSvc))
+
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "transactions:write"),
+			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
+		).Post("/transactions/pending", createPendingTransactionHandler(ledgerSvc))
+
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "transactions:write"),
+			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
+		).Post("/transactions/{id}/post", postPendingTransactionHandler(ledgerSvc))
+
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "transactions:write"),
+			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
+		).Post("/transactions/{id}/fail", failPendingTransactionHandler(ledgerSvc))
 	})
 
 	srv := &http.Server{
@@ -109,6 +149,8 @@ func main() {
 	}
 }
 
+// healthHandler reports 200 only if the database is actually reachable --
+// a health check that doesn't check the DB isn't a health check.
 func healthHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
@@ -123,7 +165,9 @@ func healthHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-
+// config holds the same DB_* env vars the CI workflow's test job already
+// sets, plus PORT and JWT_SECRET. No config library pulled in for six
+// env vars.
 type config struct {
 	DBHost     string
 	DBPort     string

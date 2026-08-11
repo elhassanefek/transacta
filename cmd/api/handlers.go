@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/elhassanefek/transacta/internal/auth"
@@ -43,7 +44,9 @@ type registerRequest struct {
 	RoleName string `json:"role_name"`
 }
 
-
+// registerHandler creates a new user within whatever tenant
+// requireTenantAPIKey resolved for this request -- it reads tenantID from
+// context, not a fixed value, since the same handler serves every tenant.
 func registerHandler(authSvc *auth.Service, authRepo *auth.Repository, db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID, ok := tenants.FromContext(r.Context())
@@ -90,7 +93,10 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
-
+// loginHandler is public (no middleware) -- the email+password pair IS
+// the credential being checked here, same as any login endpoint.
+// tenant_id is supplied by the client directly (there's no subdomain
+// routing in this project), similar to "workspace ID" login patterns.
 func loginHandler(authSvc *auth.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req loginRequest
@@ -239,7 +245,9 @@ func transferHandler(svc *ledger.Service) http.HandlerFunc {
 func writeTransferError(w http.ResponseWriter, err error) {
 	status := http.StatusUnprocessableEntity
 	switch {
-	case errors.Is(err, ledger.ErrInsufficientFunds):
+	case errors.Is(err, ledger.ErrInsufficientFunds),
+		errors.Is(err, ledger.ErrTransactionNotPending),
+		errors.Is(err, ledger.ErrStatusConflict):
 		status = http.StatusConflict
 	case errors.Is(err, ledger.ErrAccountNotFound), errors.Is(err, ledger.ErrTransactionNotFound):
 		status = http.StatusNotFound
@@ -249,4 +257,226 @@ func writeTransferError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	}
 	http.Error(w, err.Error(), status)
+}
+
+// --- Accounts ---
+
+type createAccountRequest struct {
+	Name string `json:"name"`
+}
+
+type accountResponse struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Balance int64  `json:"balance_minor"`
+}
+
+func createAccountHandler(svc *ledger.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+
+		var req createAccountRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if req.Name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+
+		account, err := svc.CreateAccount(r.Context(), tenantID, req.Name)
+		if err != nil {
+			writeTransferError(w, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(accountResponse{
+			ID:      account.ID.String(),
+			Name:    account.Name,
+			Balance: int64(account.Balance),
+		})
+	}
+}
+
+func getAccountHandler(svc *ledger.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+		accountID, err := uuid.Parse(chi.URLParam(r, "id"))
+		if err != nil {
+			http.Error(w, "invalid account id", http.StatusBadRequest)
+			return
+		}
+
+		account, err := svc.GetAccount(r.Context(), tenantID, accountID)
+		if err != nil {
+			writeTransferError(w, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(accountResponse{
+			ID:      account.ID.String(),
+			Name:    account.Name,
+			Balance: int64(account.Balance),
+		})
+	}
+}
+
+// --- Transactions (read + pending workflow) ---
+
+type entryResponse struct {
+	AccountID   string `json:"account_id"`
+	AmountMinor int64  `json:"amount_minor"`
+}
+
+type transactionDetailResponse struct {
+	ID      string          `json:"id"`
+	Status  string          `json:"status"`
+	Entries []entryResponse `json:"entries"`
+}
+
+func getTransactionHandler(svc *ledger.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+		txnID, err := uuid.Parse(chi.URLParam(r, "id"))
+		if err != nil {
+			http.Error(w, "invalid transaction id", http.StatusBadRequest)
+			return
+		}
+
+		txn, entries, err := svc.GetTransaction(r.Context(), tenantID, txnID)
+		if err != nil {
+			writeTransferError(w, err)
+			return
+		}
+
+		resp := transactionDetailResponse{ID: txn.ID.String(), Status: string(txn.Status)}
+		for _, e := range entries {
+			resp.Entries = append(resp.Entries, entryResponse{
+				AccountID:   e.AccountID.String(),
+				AmountMinor: int64(e.AmountMinor),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func createPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+
+		var req transferRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		entries := make([]ledger.EntryInput, 0, len(req.Entries))
+		for _, e := range req.Entries {
+			accountID, err := uuid.Parse(e.AccountID)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid account_id: %q", e.AccountID), http.StatusBadRequest)
+				return
+			}
+			entries = append(entries, ledger.EntryInput{
+				AccountID:   accountID,
+				AmountMinor: ledger.Money(e.AmountMinor),
+			})
+		}
+
+		txn, _, err := svc.CreatePendingTransaction(r.Context(), ledger.TransferRequest{
+			TenantID: tenantID,
+			Entries:  entries,
+		})
+		if err != nil {
+			writeTransferError(w, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(transferResponse{
+			TransactionID: txn.ID.String(),
+			Status:        string(txn.Status),
+		})
+	}
+}
+
+func postPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+		txnID, err := uuid.Parse(chi.URLParam(r, "id"))
+		if err != nil {
+			http.Error(w, "invalid transaction id", http.StatusBadRequest)
+			return
+		}
+
+		txn, err := svc.PostPendingTransaction(r.Context(), tenantID, txnID)
+		if err != nil {
+			writeTransferError(w, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(transferResponse{
+			TransactionID: txn.ID.String(),
+			Status:        string(txn.Status),
+		})
+	}
+}
+
+func failPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+		txnID, err := uuid.Parse(chi.URLParam(r, "id"))
+		if err != nil {
+			http.Error(w, "invalid transaction id", http.StatusBadRequest)
+			return
+		}
+
+		txn, err := svc.FailPendingTransaction(r.Context(), tenantID, txnID)
+		if err != nil {
+			writeTransferError(w, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(transferResponse{
+			TransactionID: txn.ID.String(),
+			Status:        string(txn.Status),
+		})
+	}
 }
