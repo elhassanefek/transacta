@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 )
 
+
 type Service struct {
 	repo *Repository
 }
@@ -16,11 +17,11 @@ func NewService(repo *Repository) *Service {
 	return &Service{repo: repo}
 }
 
-// TransferRequest describes a balanced set of movements for one tenant.
 type TransferRequest struct {
 	TenantID uuid.UUID
 	Entries  []EntryInput
 }
+
 
 func validateEntries(entries []EntryInput) error {
 	if len(entries) < 2 {
@@ -49,6 +50,7 @@ func uniqueAccountIDs(entries []EntryInput) []uuid.UUID {
 	return ids
 }
 
+
 func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Transaction, []*Entry, error) {
 	if err := validateEntries(req.Entries); err != nil {
 		return nil, nil, err
@@ -66,6 +68,7 @@ func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Tr
 		return nil, nil, err
 	}
 
+	
 	projected := make(map[uuid.UUID]Money, len(accounts))
 	for id, a := range accounts {
 		projected[id] = a.Balance
@@ -90,6 +93,7 @@ func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Tr
 	return txn, entries, nil
 }
 
+
 func (s *Service) CreatePendingTransaction(ctx context.Context, req TransferRequest) (*Transaction, []*Entry, error) {
 	if err := validateEntries(req.Entries); err != nil {
 		return nil, nil, err
@@ -110,6 +114,7 @@ func (s *Service) CreatePendingTransaction(ctx context.Context, req TransferRequ
 	}
 	return txn, entries, nil
 }
+
 
 func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, error) {
 	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -158,6 +163,7 @@ func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.
 	return txn, nil
 }
 
+
 func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, error) {
 	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -183,10 +189,17 @@ func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.
 	return txn, nil
 }
 
+
+func (s *Service) CreateAccount(ctx context.Context, tenantID uuid.UUID, name string) (*Account, error) {
+	return s.repo.CreateAccount(ctx, s.repo.db, tenantID, name)
+}
+
+// GetTransaction is a read-only passthrough for API/handlers.
 func (s *Service) GetTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, []*Entry, error) {
 	return s.repo.GetTransaction(ctx, s.repo.db, tenantID, id)
 }
 
+// GetAccount is a read-only passthrough for API/handlers.
 func (s *Service) GetAccount(ctx context.Context, tenantID, id uuid.UUID) (*Account, error) {
 	return s.repo.GetAccount(ctx, s.repo.db, tenantID, id)
 }
