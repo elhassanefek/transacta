@@ -8,20 +8,35 @@ import (
 	"github.com/google/uuid"
 )
 
-
 type Service struct {
-	repo *Repository
+	repo   *Repository
+	events EventEnqueuer // nil is valid: event emission is optional
 }
 
-func NewService(repo *Repository) *Service {
-	return &Service{repo: repo}
+// Option configures optional Service behavior.
+type Option func(*Service)
+
+// WithEventEnqueuer wires event emission into the service. Without this,
+// ExecuteTransfer/CreatePendingTransaction/PostPendingTransaction/
+// FailPendingTransaction all behave exactly as before -- event emission
+// is additive, never required, so every existing caller/test that never
+// configures one keeps working unmodified.
+func WithEventEnqueuer(e EventEnqueuer) Option {
+	return func(s *Service) { s.events = e }
+}
+
+func NewService(repo *Repository, opts ...Option) *Service {
+	s := &Service{repo: repo}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 type TransferRequest struct {
 	TenantID uuid.UUID
 	Entries  []EntryInput
 }
-
 
 func validateEntries(entries []EntryInput) error {
 	if len(entries) < 2 {
@@ -50,6 +65,32 @@ func uniqueAccountIDs(entries []EntryInput) []uuid.UUID {
 	return ids
 }
 
+// emitEvent enqueues a lifecycle event inside tx, the same transaction
+// that's about to commit the state change it reports. If events is nil
+// (not configured), this is a no-op.
+//
+// If Enqueue itself fails, this returns that error, and every call site
+// below returns early on it -- which means the whole transaction rolls
+// back, the transfer/status-change never happens. That's deliberate,
+// not overly strict: the entire point of the transactional outbox
+// pattern is that "the state change happened" and "an event recording
+// it exists" are atomic, never two independent writes that could
+// disagree. Letting the transfer succeed while silently dropping its
+// event would reintroduce exactly the dual-write problem this pattern
+// exists to eliminate.
+func (s *Service) emitEvent(ctx context.Context, tx *sql.Tx, tenantID uuid.UUID, eventType string, txn *Transaction) error {
+	if s.events == nil {
+		return nil
+	}
+	payload, err := transactionEventJSON(txn)
+	if err != nil {
+		return fmt.Errorf("ledger: marshal event payload: %w", err)
+	}
+	if err := s.events.EnqueueEvent(ctx, tx, tenantID, eventType, payload); err != nil {
+		return fmt.Errorf("ledger: enqueue event: %w", err)
+	}
+	return nil
+}
 
 func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Transaction, []*Entry, error) {
 	if err := validateEntries(req.Entries); err != nil {
@@ -68,7 +109,6 @@ func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Tr
 		return nil, nil, err
 	}
 
-	
 	projected := make(map[uuid.UUID]Money, len(accounts))
 	for id, a := range accounts {
 		projected[id] = a.Balance
@@ -87,12 +127,15 @@ func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Tr
 		return nil, nil, err
 	}
 
+	if err := s.emitEvent(ctx, tx, req.TenantID, EventTransactionPosted, txn); err != nil {
+		return nil, nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, nil, fmt.Errorf("ledger: commit transfer: %w", err)
 	}
 	return txn, entries, nil
 }
-
 
 func (s *Service) CreatePendingTransaction(ctx context.Context, req TransferRequest) (*Transaction, []*Entry, error) {
 	if err := validateEntries(req.Entries); err != nil {
@@ -109,12 +152,14 @@ func (s *Service) CreatePendingTransaction(ctx context.Context, req TransferRequ
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := s.emitEvent(ctx, tx, req.TenantID, EventTransactionPending, txn); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, fmt.Errorf("ledger: commit pending transaction: %w", err)
 	}
 	return txn, entries, nil
 }
-
 
 func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, error) {
 	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -155,14 +200,17 @@ func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.
 	if err := s.repo.UpdateTransactionStatusGuarded(ctx, tx, tenantID, txn.ID, StatusPending, StatusPosted); err != nil {
 		return nil, err
 	}
+	txn.Status = StatusPosted
+
+	if err := s.emitEvent(ctx, tx, tenantID, EventTransactionPosted, txn); err != nil {
+		return nil, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("ledger: commit post: %w", err)
 	}
-	txn.Status = StatusPosted
 	return txn, nil
 }
-
 
 func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, error) {
 	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -182,13 +230,17 @@ func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.
 	if err := s.repo.UpdateTransactionStatusGuarded(ctx, tx, tenantID, txn.ID, StatusPending, StatusFailed); err != nil {
 		return nil, err
 	}
+	txn.Status = StatusFailed
+
+	if err := s.emitEvent(ctx, tx, tenantID, EventTransactionFailed, txn); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("ledger: commit fail: %w", err)
 	}
-	txn.Status = StatusFailed
 	return txn, nil
 }
-
 
 func (s *Service) CreateAccount(ctx context.Context, tenantID uuid.UUID, name string) (*Account, error) {
 	return s.repo.CreateAccount(ctx, s.repo.db, tenantID, name)
