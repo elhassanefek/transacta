@@ -2,14 +2,11 @@ name: Transacta CI/CD
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches: ["main", "develop"]
   pull_request:
-    branches: [ "main", "develop" ]
+    branches: ["main", "develop"]
 
 jobs:
-  # -------------------------------------------------------------
-  # Job 1: Linting & Code Quality
-  # -------------------------------------------------------------
   lint:
     name: Lint & Static Analysis
     runs-on: ubuntu-latest
@@ -20,7 +17,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.5'
+          go-version: "1.26.5"
           cache: true
 
       - name: Run golangci-lint
@@ -28,9 +25,6 @@ jobs:
         with:
           version: v2.12
 
-  # -------------------------------------------------------------
-  # Job 2: Build & Integration Tests (With PostgreSQL)
-  # -------------------------------------------------------------
   test:
     name: Run Unit & Concurrency Tests
     runs-on: ubuntu-latest
@@ -59,7 +53,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.5'
+          go-version: "1.26.5"
           cache: true
 
       # Inject DB Connection details for tests
@@ -74,9 +68,6 @@ jobs:
 
         run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
 
-  # -------------------------------------------------------------
-  # Job 3: Verify Docker Build
-  # -------------------------------------------------------------
   docker-build:
     name: Verify Docker Image Build
     runs-on: ubuntu-latest

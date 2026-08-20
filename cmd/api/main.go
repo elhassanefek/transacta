@@ -21,8 +21,8 @@ import (
 	authmw "github.com/elhassanefek/transacta/internal/middleware/auth"
 	"github.com/elhassanefek/transacta/internal/middleware/idempotency"
 	"github.com/elhassanefek/transacta/internal/tenants"
+	"github.com/elhassanefek/transacta/internal/webhook"
 )
-
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -49,15 +49,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	ledgerRepo := ledger.NewRepository(db)
-	ledgerSvc := ledger.NewService(ledgerRepo)
-
 	idemRepo := idempotency.NewRepository(db)
 
 	authRepo := auth.NewRepository(db)
 	authSvc := auth.NewService(authRepo, []byte(cfg.JWTSecret))
 
 	tenantRepo := tenants.NewRepository(db)
+
+	// webhookRepo is wired into ledgerSvc below via WithEventEnqueuer --
+	// see internal/ledger/events.go for why ledger depends on a small
+	// interface it defines itself, rather than importing this package
+	// directly.
+	webhookRepo := webhook.NewRepository(db)
+	webhookSvc := webhook.NewService(webhookRepo, webhook.WithLogger(logger))
+	webhookWorker := webhook.NewWorker(webhookRepo, webhookSvc, webhook.WithWorkerLogger(logger))
+
+	ledgerRepo := ledger.NewRepository(db)
+	ledgerSvc := ledger.NewService(ledgerRepo, ledger.WithEventEnqueuer(webhookRepo))
+
+	// The webhook worker runs independently of the HTTP server's request
+	// lifecycle -- its own cancellable context, started before the
+	// server begins accepting requests, stopped as part of the same
+	// graceful-shutdown sequence below.
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	go webhookWorker.Run(workerCtx)
+	logger.Info("webhook worker started")
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -141,6 +158,13 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down")
+
+	// Stop accepting new webhook delivery work before tearing down the
+	// HTTP server -- order doesn't strictly matter here (they're
+	// independent), but stopping the worker first means no new delivery
+	// attempts start during the shutdown window.
+	workerCancel()
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
