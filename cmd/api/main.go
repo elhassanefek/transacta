@@ -20,6 +20,7 @@ import (
 	"github.com/elhassanefek/transacta/internal/ledger"
 	authmw "github.com/elhassanefek/transacta/internal/middleware/auth"
 	"github.com/elhassanefek/transacta/internal/middleware/idempotency"
+	"github.com/elhassanefek/transacta/internal/middleware/logging"
 	"github.com/elhassanefek/transacta/internal/tenants"
 	"github.com/elhassanefek/transacta/internal/webhook"
 )
@@ -78,6 +79,7 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(logging.Middleware(logger))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 
