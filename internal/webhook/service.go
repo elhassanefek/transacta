@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"net/http"
 	"time"
+
+	"github.com/elhassanefek/transacta/internal/metrics"
 )
 
 
@@ -65,18 +67,13 @@ func NewService(repo *Repository, opts ...Option) *Service {
 	return s
 }
 
-// ProcessEvent delivers one already-claimed (status='processing') event
-// and persists the outcome: MarkDelivered on success, ScheduleRetry with
-// computed backoff on a retryable failure, or MoveToDeadLetter once
-// maxAttempts is reached. Every outcome is written, so an event is never
-// left stuck at 'processing' after this returns -- that status only ever
-// exists for the brief window between ClaimPendingEvents and this
-// function's completion.
+
 func (s *Service) ProcessEvent(ctx context.Context, ev *Event) {
 	deliverErr := s.deliver(ctx, ev)
 	attempt := ev.AttemptCount + 1
 
 	if deliverErr == nil {
+		metrics.WebhookDeliveredTotal.Inc()
 		if err := s.repo.MarkDelivered(ctx, s.repo.db, ev.ID); err != nil {
 			s.logger.Error("webhook: failed to mark event delivered", "event_id", ev.ID, "error", err)
 		}
@@ -90,11 +87,13 @@ func (s *Service) ProcessEvent(ctx context.Context, ev *Event) {
 		// the tenant configures a URL would need its own trigger; for
 		// now this just logs and moves on, matching the "not a delivery
 		// failure" framing in ErrNoEndpointConfigured's doc comment.
+		metrics.WebhookSkippedNoEndpointTotal.Inc()
 		s.logger.Warn("webhook: no endpoint configured, skipping", "event_id", ev.ID, "tenant_id", ev.TenantID)
 		return
 	}
 
 	if attempt >= s.maxAttempts {
+		metrics.WebhookDeadLetteredTotal.Inc()
 		tx, err := s.repo.BeginTx(ctx, nil)
 		if err != nil {
 			s.logger.Error("webhook: begin tx for dead-letter", "event_id", ev.ID, "error", err)
@@ -115,6 +114,7 @@ func (s *Service) ProcessEvent(ctx context.Context, ev *Event) {
 		return
 	}
 
+	metrics.WebhookRetriedTotal.Inc()
 	nextRetryAt := time.Now().Add(s.backoffForAttempt(attempt))
 	if err := s.repo.ScheduleRetry(ctx, s.repo.db, ev.ID, attempt, nextRetryAt, deliverErr.Error()); err != nil {
 		s.logger.Error("webhook: schedule retry failed", "event_id", ev.ID, "error", err)
@@ -154,11 +154,7 @@ func (s *Service) deliver(ctx context.Context, ev *Event) error {
 	return nil
 }
 
-// backoffForAttempt computes exponential backoff with jitter: base *
-// 2^(attempt-1), capped at maxBackoff, then randomized within +/-20% so
-// that many events failing at once (e.g. a receiver's endpoint going
-// down) don't all retry at the exact same instant and re-hammer it the
-// moment it recovers.
+
 func (s *Service) backoffForAttempt(attempt int) time.Duration {
 	exp := math.Pow(2, float64(attempt-1))
 	backoff := time.Duration(float64(s.baseBackoff) * exp)
