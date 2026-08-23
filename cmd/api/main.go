@@ -18,9 +18,11 @@ import (
 
 	"github.com/elhassanefek/transacta/internal/auth"
 	"github.com/elhassanefek/transacta/internal/ledger"
+	appmetrics "github.com/elhassanefek/transacta/internal/metrics"
 	authmw "github.com/elhassanefek/transacta/internal/middleware/auth"
 	"github.com/elhassanefek/transacta/internal/middleware/idempotency"
 	"github.com/elhassanefek/transacta/internal/middleware/logging"
+	metricsmw "github.com/elhassanefek/transacta/internal/middleware/metrics"
 	"github.com/elhassanefek/transacta/internal/tenants"
 	"github.com/elhassanefek/transacta/internal/webhook"
 )
@@ -80,10 +82,15 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(logging.Middleware(logger))
+	r.Use(metricsmw.Middleware)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 
 	r.Get("/healthz", healthHandler(db))
+	// Deliberately unauthenticated -- see appmetrics.Handler's doc
+	// comment on why this needs network-level restriction in a real
+	// deployment, not application-level auth.
+	r.Handle("/metrics", appmetrics.Handler())
 
 	r.Route("/v1", func(r chi.Router) {
 		// Registration is gated by the tenant's own API key -- proving
