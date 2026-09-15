@@ -19,13 +19,16 @@ services:
       timeout: 3s
       retries: 5
 
-  # One-shot migration runner. Does NOT start with `docker compose up`
-  # (it's in the "tools" profile) — invoke it explicitly via the
-  # Makefile targets (make migrate-up / migrate-down / migrate-create).
+  # One-shot migration runner. Part of the default (un-profiled) service
+  # set, so `docker compose up` applies every pending migration before
+  # `api` is allowed to start -- see api's `depends_on` below. It runs
+  # `migrate ... up` to completion and exits 0; compose does not restart
+  # it. The same image/service is still reused for manual rollback via
+  # the Makefile targets (make migrate-down / migrate-create), which
+  # override `command`.
   migrate:
     image: migrate/migrate:v4.17.1
     container_name: transacta_migrate
-    profiles: ["tools"]
     volumes:
       - ../migrations:/migrations
     depends_on:
@@ -37,9 +40,50 @@ services:
         "-path", "/migrations",
         "-database", "postgres://transacta:transacta_dev@postgres:5432/transacta?sslmode=disable"
       ]
-    # default command if you run `docker compose --profile tools run migrate`
-    # with no extra args; Makefile overrides this per target.
     command: ["up"]
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: transacta_api
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: transacta
+      DB_PASSWORD: transacta_dev
+      DB_NAME: transacta
+      DB_SSLMODE: disable
+      PORT: "8080"
+      # Deliberately no hard `${JWT_SECRET:?...}` requirement here: that
+      # form makes compose fail interpolation for the *entire* file,
+      # including `up -d postgres` or `run --rm migrate` -- commands
+      # that don't touch this service at all (compose interpolates every
+      # service's variables before deciding what you actually asked to
+      # start, not just the ones you targeted). Empty is passed through
+      # instead, and cmd/api/main.go's own `JWT_SECRET == ""` check
+      # refuses to start the api container with a clear log message --
+      # still a fast, clear failure, just surfaced by `api`'s own
+      # container exiting rather than by the `docker compose` invocation
+      # itself. Set a real value in docker/.env -- see docker/.env.example.
+      JWT_SECRET: ${JWT_SECRET:-}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # service_completed_successfully, not just "started" -- api must
+      # never begin accepting requests against a schema that migrate
+      # hasn't finished applying yet.
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
 volumes:
   pgdata:

@@ -1,3 +1,5 @@
+//go:build integration
+
 // Run with: go test -tags=integration -race ./internal/ledger/... -v
 // Requires Docker running locally; testcontainers-go pulls a real
 // postgres:16 image and applies migrations/000001_init.up.sql +
@@ -251,7 +253,7 @@ func TestPostPendingTransaction_StatusGuardConflict(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			_, err := svc.PostPendingTransaction(ctx, tenantID, txn.ID)
+			_, err := svc.PostPendingTransaction(ctx, tenantID, txn.ID, "")
 			results[idx] = err
 		}(i)
 	}

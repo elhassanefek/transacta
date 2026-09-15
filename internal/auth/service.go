@@ -15,15 +15,11 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-
 const bcryptCost = 12
-
 
 const DefaultAccessTokenTTL = 15 * time.Minute
 
-
 const DefaultRefreshTokenTTL = 7 * 24 * time.Hour
-
 
 type Claims struct {
 	UserID   string `json:"user_id"`
@@ -32,12 +28,12 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-
 type Service struct {
 	repo            *Repository
 	jwtSecret       []byte
 	accessTokenTTL  time.Duration
 	refreshTokenTTL time.Duration
+	audit           AuditRecorder // nil is valid: audit recording is optional
 }
 
 // Option configures optional Service behavior.
@@ -46,6 +42,9 @@ type Option func(*Service)
 func WithAccessTokenTTL(d time.Duration) Option  { return func(s *Service) { s.accessTokenTTL = d } }
 func WithRefreshTokenTTL(d time.Duration) Option { return func(s *Service) { s.refreshTokenTTL = d } }
 
+// WithAuditRecorder wires audit-trail recording into the service, same
+// additive/optional shape as ledger.WithAuditRecorder.
+func WithAuditRecorder(a AuditRecorder) Option { return func(s *Service) { s.audit = a } }
 
 func NewService(repo *Repository, jwtSecret []byte, opts ...Option) *Service {
 	s := &Service{
@@ -60,15 +59,41 @@ func NewService(repo *Repository, jwtSecret []byte, opts ...Option) *Service {
 	return s
 }
 
-
 func (s *Service) Register(ctx context.Context, tenantID, roleID uuid.UUID, email, password string) (*User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		return nil, fmt.Errorf("auth: hash password: %w", err)
 	}
-	return s.repo.CreateUser(ctx, s.repo.db, tenantID, roleID, email, string(hash))
-}
 
+	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("auth: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	user, err := s.repo.CreateUser(ctx, tx, tenantID, roleID, email, string(hash))
+	if err != nil {
+		return nil, err
+	}
+
+	// authActorAPIKey, not user.ID: registration is authenticated by the
+	// tenant's own API key (see requireTenantAPIKey in cmd/api/handlers.go),
+	// proving "I'm allowed to provision users for this tenant" -- there's
+	// no user session behind this call, by definition, since the user
+	// being audited is the one this call is in the middle of creating.
+	if err := s.recordAudit(ctx, tx, tenantID, auditActorAPIKey, AuditUserRegistered, map[string]any{
+		"user_id": user.ID.String(),
+		"email":   user.Email,
+		"role_id": roleID.String(),
+	}); err != nil {
+		return nil, fmt.Errorf("auth: record audit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("auth: commit register: %w", err)
+	}
+	return user, nil
+}
 
 type AuthResult struct {
 	AccessToken      string
@@ -76,7 +101,6 @@ type AuthResult struct {
 	AccessExpiresAt  time.Time
 	RefreshExpiresAt time.Time
 }
-
 
 func (s *Service) Login(ctx context.Context, tenantID uuid.UUID, email, password string) (*AuthResult, error) {
 	user, err := s.repo.GetUserByEmail(ctx, s.repo.db, tenantID, email)
@@ -98,14 +122,33 @@ func (s *Service) Login(ctx context.Context, tenantID uuid.UUID, email, password
 		return nil, ErrUserDisabled
 	}
 
-	return s.issueTokenPair(ctx, s.repo.db, user)
+	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("auth: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := s.issueTokenPair(ctx, tx, user)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.recordAudit(ctx, tx, user.TenantID, user.ID.String(), AuditUserLoggedIn, map[string]any{
+		"user_id": user.ID.String(),
+	}); err != nil {
+		return nil, fmt.Errorf("auth: record audit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("auth: commit login: %w", err)
+	}
+	return result, nil
 }
 
 // dummyBcryptHash is a valid bcrypt hash of an arbitrary fixed string,
 // used only to give Login's nonexistent-user path a comparably expensive
 // operation to perform. It does not correspond to any real credential.
 const dummyBcryptHash = "$2a$12$C6UzMDM.H6dfI/f/IKcEeO2Fv/eLwWGdWMi4X1zXK4H8xh0.0V6i2"
-
 
 func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (*AuthResult, error) {
 	tokenHash := hashToken(rawRefreshToken)
@@ -155,6 +198,13 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (*AuthRes
 		// gets rolled back with the transaction, nothing persists.
 		return nil, err
 	}
+
+	if err := s.recordAudit(ctx, tx, user.TenantID, user.ID.String(), AuditTokenRefreshed, map[string]any{
+		"user_id": user.ID.String(),
+	}); err != nil {
+		return nil, fmt.Errorf("auth: record audit: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("auth: commit refresh: %w", err)
 	}
@@ -171,14 +221,33 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (*AuthRes
 	}, nil
 }
 
-
 func (s *Service) Logout(ctx context.Context, rawRefreshToken string) error {
 	tokenHash := hashToken(rawRefreshToken)
 	existing, err := s.repo.GetRefreshTokenByHash(ctx, s.repo.db, tokenHash)
 	if err != nil {
 		return err
 	}
-	return s.repo.RevokeRefreshToken(ctx, s.repo.db, existing.ID)
+
+	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("auth: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.repo.RevokeRefreshToken(ctx, tx, existing.ID); err != nil {
+		return err
+	}
+
+	if err := s.recordAudit(ctx, tx, existing.TenantID, existing.UserID.String(), AuditUserLoggedOut, map[string]any{
+		"user_id": existing.UserID.String(),
+	}); err != nil {
+		return fmt.Errorf("auth: record audit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("auth: commit logout: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) GetUserPermissions(ctx context.Context, tenantID, userID uuid.UUID) ([]string, error) {
@@ -243,7 +312,6 @@ func (s *Service) generateAccessToken(user *User) (string, time.Time, error) {
 	return signed, expiresAt, nil
 }
 
-
 func generateRawToken() (raw string, hash string, err error) {
 	buf := make([]byte, 32) // 256 bits
 	if _, err := rand.Read(buf); err != nil {
@@ -252,7 +320,6 @@ func generateRawToken() (raw string, hash string, err error) {
 	raw = hex.EncodeToString(buf)
 	return raw, hashToken(raw), nil
 }
-
 
 func hashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))

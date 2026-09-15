@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,13 +15,16 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/elhassanefek/transacta/internal/audit"
 	"github.com/elhassanefek/transacta/internal/auth"
+	"github.com/elhassanefek/transacta/internal/config"
 	"github.com/elhassanefek/transacta/internal/ledger"
 	appmetrics "github.com/elhassanefek/transacta/internal/metrics"
 	authmw "github.com/elhassanefek/transacta/internal/middleware/auth"
 	"github.com/elhassanefek/transacta/internal/middleware/idempotency"
 	"github.com/elhassanefek/transacta/internal/middleware/logging"
 	metricsmw "github.com/elhassanefek/transacta/internal/middleware/metrics"
+	"github.com/elhassanefek/transacta/internal/middleware/recovery"
 	"github.com/elhassanefek/transacta/internal/tenants"
 	"github.com/elhassanefek/transacta/internal/webhook"
 )
@@ -30,9 +32,9 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	cfg := loadConfig()
+	cfg := config.Load()
 
-	db, err := sql.Open("pgx", cfg.databaseDSN())
+	db, err := sql.Open("pgx", cfg.DatabaseDSN())
 	if err != nil {
 		logger.Error("open database", "error", err)
 		os.Exit(1)
@@ -53,9 +55,10 @@ func main() {
 	}
 
 	idemRepo := idempotency.NewRepository(db)
+	auditRepo := audit.NewRepository(db)
 
 	authRepo := auth.NewRepository(db)
-	authSvc := auth.NewService(authRepo, []byte(cfg.JWTSecret))
+	authSvc := auth.NewService(authRepo, []byte(cfg.JWTSecret), auth.WithAuditRecorder(auditRepo))
 
 	tenantRepo := tenants.NewRepository(db)
 
@@ -68,7 +71,7 @@ func main() {
 	webhookWorker := webhook.NewWorker(webhookRepo, webhookSvc, webhook.WithWorkerLogger(logger))
 
 	ledgerRepo := ledger.NewRepository(db)
-	ledgerSvc := ledger.NewService(ledgerRepo, ledger.WithEventEnqueuer(webhookRepo))
+	ledgerSvc := ledger.NewService(ledgerRepo, ledger.WithEventEnqueuer(webhookRepo), ledger.WithAuditRecorder(auditRepo))
 
 	// The webhook worker runs independently of the HTTP server's request
 	// lifecycle -- its own cancellable context, started before the
@@ -83,7 +86,14 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(logging.Middleware(logger))
 	r.Use(metricsmw.Middleware)
-	r.Use(middleware.Recoverer)
+	// recovery must stay mounted here, closer to the handler than
+	// logging -- see logging_test.go's
+	// TestMiddleware_MountedBeforeRecoverer_LogsActualRecoveredStatus,
+	// which pins this order: it's what lets logging's status recorder
+	// observe the 500 that recovery writes on a panic, instead of
+	// logging a zero/unwritten status because the panic skipped past
+	// logging's own post-request log line entirely.
+	r.Use(recovery.Middleware(logger))
 	r.Use(middleware.Timeout(30 * time.Second))
 
 	r.Get("/healthz", healthHandler(db))
@@ -146,6 +156,11 @@ func main() {
 			authmw.RequirePermission(authSvc, "transactions:write"),
 			idempotency.Middleware(idemRepo, idempotency.DefaultTTL),
 		).Post("/transactions/{id}/fail", failPendingTransactionHandler(ledgerSvc))
+
+		r.With(
+			authmw.Middleware(authSvc),
+			authmw.RequirePermission(authSvc, "audit:read"),
+		).Get("/audit-log", auditLogHandler(auditRepo))
 	})
 
 	srv := &http.Server{
@@ -196,45 +211,4 @@ func healthHandler(db *sql.DB) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}
-}
-
-// config holds the same DB_* env vars the CI workflow's test job already
-// sets, plus PORT and JWT_SECRET. No config library pulled in for six
-// env vars.
-type config struct {
-	DBHost     string
-	DBPort     string
-	DBUser     string
-	DBPassword string
-	DBName     string
-	DBSSLMode  string
-	Port       string
-	JWTSecret  string
-}
-
-func loadConfig() config {
-	return config{
-		DBHost:     getenv("DB_HOST", "localhost"),
-		DBPort:     getenv("DB_PORT", "5432"),
-		DBUser:     getenv("DB_USER", "transacta"),
-		DBPassword: getenv("DB_PASSWORD", "transacta_dev"),
-		DBName:     getenv("DB_NAME", "transacta"),
-		DBSSLMode:  getenv("DB_SSLMODE", "disable"),
-		Port:       getenv("PORT", "8080"),
-		JWTSecret:  getenv("JWT_SECRET", ""),
-	}
-}
-
-func (c config) databaseDSN() string {
-	return fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		c.DBHost, c.DBPort, c.DBUser, c.DBPassword, c.DBName, c.DBSSLMode,
-	)
-}
-
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

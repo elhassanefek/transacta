@@ -11,6 +11,7 @@ import (
 type Service struct {
 	repo   *Repository
 	events EventEnqueuer // nil is valid: event emission is optional
+	audit  AuditRecorder // nil is valid: audit recording is optional
 }
 
 // Option configures optional Service behavior.
@@ -25,6 +26,12 @@ func WithEventEnqueuer(e EventEnqueuer) Option {
 	return func(s *Service) { s.events = e }
 }
 
+// WithAuditRecorder wires audit-trail recording into the service, same
+// additive/optional shape as WithEventEnqueuer.
+func WithAuditRecorder(a AuditRecorder) Option {
+	return func(s *Service) { s.audit = a }
+}
+
 func NewService(repo *Repository, opts ...Option) *Service {
 	s := &Service{repo: repo}
 	for _, opt := range opts {
@@ -36,6 +43,13 @@ func NewService(repo *Repository, opts ...Option) *Service {
 type TransferRequest struct {
 	TenantID uuid.UUID
 	Entries  []EntryInput
+	// ActorID identifies who initiated this transfer for the audit
+	// trail -- normally the authenticated user's ID (from JWT claims),
+	// passed through by the HTTP handler. Empty is valid: it just
+	// produces an audit row with an empty actor_id rather than blocking
+	// the operation, since audit recording itself is optional (nil
+	// AuditRecorder).
+	ActorID string
 }
 
 func validateEntries(entries []EntryInput) error {
@@ -131,6 +145,10 @@ func (s *Service) ExecuteTransfer(ctx context.Context, req TransferRequest) (*Tr
 		return nil, nil, err
 	}
 
+	if err := s.recordAudit(ctx, tx, req.TenantID, req.ActorID, AuditTransactionTransferred, transferAuditPayload(txn, req.Entries)); err != nil {
+		return nil, nil, fmt.Errorf("ledger: record audit: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, nil, fmt.Errorf("ledger: commit transfer: %w", err)
 	}
@@ -155,13 +173,16 @@ func (s *Service) CreatePendingTransaction(ctx context.Context, req TransferRequ
 	if err := s.emitEvent(ctx, tx, req.TenantID, EventTransactionPending, txn); err != nil {
 		return nil, nil, err
 	}
+	if err := s.recordAudit(ctx, tx, req.TenantID, req.ActorID, AuditTransactionPendingCreated, transferAuditPayload(txn, req.Entries)); err != nil {
+		return nil, nil, fmt.Errorf("ledger: record audit: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, fmt.Errorf("ledger: commit pending transaction: %w", err)
 	}
 	return txn, entries, nil
 }
 
-func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, error) {
+func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.UUID, actorID string) (*Transaction, error) {
 	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("ledger: begin tx: %w", err)
@@ -206,13 +227,17 @@ func (s *Service) PostPendingTransaction(ctx context.Context, tenantID, id uuid.
 		return nil, err
 	}
 
+	if err := s.recordAudit(ctx, tx, tenantID, actorID, AuditTransactionPosted, statusChangeAuditPayload(txn)); err != nil {
+		return nil, fmt.Errorf("ledger: record audit: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("ledger: commit post: %w", err)
 	}
 	return txn, nil
 }
 
-func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.UUID) (*Transaction, error) {
+func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.UUID, actorID string) (*Transaction, error) {
 	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("ledger: begin tx: %w", err)
@@ -236,14 +261,39 @@ func (s *Service) FailPendingTransaction(ctx context.Context, tenantID, id uuid.
 		return nil, err
 	}
 
+	if err := s.recordAudit(ctx, tx, tenantID, actorID, AuditTransactionFailed, statusChangeAuditPayload(txn)); err != nil {
+		return nil, fmt.Errorf("ledger: record audit: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("ledger: commit fail: %w", err)
 	}
 	return txn, nil
 }
 
-func (s *Service) CreateAccount(ctx context.Context, tenantID uuid.UUID, name string) (*Account, error) {
-	return s.repo.CreateAccount(ctx, s.repo.db, tenantID, name)
+func (s *Service) CreateAccount(ctx context.Context, tenantID uuid.UUID, name, actorID string) (*Account, error) {
+	tx, err := s.repo.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("ledger: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	account, err := s.repo.CreateAccount(ctx, tx, tenantID, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.recordAudit(ctx, tx, tenantID, actorID, AuditAccountCreated, map[string]any{
+		"account_id": account.ID.String(),
+		"name":       account.Name,
+	}); err != nil {
+		return nil, fmt.Errorf("ledger: record audit: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("ledger: commit create account: %w", err)
+	}
+	return account, nil
 }
 
 // GetTransaction is a read-only passthrough for API/handlers.

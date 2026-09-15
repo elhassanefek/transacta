@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-)
 
+	"github.com/elhassanefek/transacta/internal/queue"
+)
 
 type DBTX interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -18,125 +19,93 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// Repository is webhook delivery's persistence layer. The outbox/retry/
+// dead-letter mechanics it exposes (Enqueue, ClaimPendingEvents,
+// MarkDelivered, ScheduleRetry, MoveToDeadLetter) are thin adapters over
+// internal/queue's generic Postgres-backed job queue, configured here
+// against the webhook_events/dead_letter_events tables -- webhook.Event
+// is queue.Job under a name this package's callers already expect.
+// GetTenantWebhookConfig, by contrast, is genuinely webhook-specific (no
+// generic queue concept of "delivery endpoint") and talks to the
+// tenants table directly.
 type Repository struct {
-	db *sql.DB
+	db    *sql.DB
+	queue *queue.Repository
 }
 
 func NewRepository(db *sql.DB) *Repository {
-	return &Repository{db: db}
+	return &Repository{
+		db:    db,
+		queue: queue.NewRepository(db, "webhook_events", "dead_letter_events"),
+	}
 }
 
 func (r *Repository) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	return r.db.BeginTx(ctx, opts)
 }
 
-
 func (r *Repository) Enqueue(ctx context.Context, q DBTX, tenantID uuid.UUID, eventType string, payload json.RawMessage) (*Event, error) {
-	ev := &Event{TenantID: tenantID, EventType: eventType, Payload: payload, Status: StatusPending}
-	const query = `
-		INSERT INTO webhook_events (tenant_id, event_type, payload, status, attempt_count, next_retry_at)
-		VALUES ($1, $2, $3, 'pending', 0, now())
-		RETURNING id, attempt_count, next_retry_at, created_at`
-	err := q.QueryRowContext(ctx, query, tenantID, eventType, []byte(payload)).
-		Scan(&ev.ID, &ev.AttemptCount, &ev.NextRetryAt, &ev.CreatedAt)
+	job, err := r.queue.Enqueue(ctx, q, tenantID, eventType, payload)
 	if err != nil {
 		return nil, fmt.Errorf("webhook: enqueue: %w", err)
 	}
-	return ev, nil
+	return eventFromJob(job), nil
 }
 
-
 func (r *Repository) ClaimPendingEvents(ctx context.Context, tx *sql.Tx, limit int) ([]*Event, error) {
-	const query = `
-		UPDATE webhook_events
-		SET status = 'processing'
-		WHERE id IN (
-			SELECT id FROM webhook_events
-			WHERE status = 'pending' AND next_retry_at <= now()
-			ORDER BY next_retry_at
-			LIMIT $1
-			FOR UPDATE SKIP LOCKED
-		)
-		RETURNING id, tenant_id, event_type, payload, status, attempt_count, next_retry_at, created_at, last_error`
-	rows, err := tx.QueryContext(ctx, query, limit)
+	jobs, err := r.queue.ClaimPending(ctx, tx, limit)
 	if err != nil {
 		return nil, fmt.Errorf("webhook: claim pending events: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var events []*Event
-	for rows.Next() {
-		ev, err := scanEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, ev)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("webhook: claim pending events: %w", err)
+	events := make([]*Event, 0, len(jobs))
+	for _, job := range jobs {
+		events = append(events, eventFromJob(job))
 	}
 	return events, nil
 }
 
 // GetEvent reads a single event, tenant-scoped.
 func (r *Repository) GetEvent(ctx context.Context, q DBTX, tenantID, eventID uuid.UUID) (*Event, error) {
-	const query = `
-		SELECT id, tenant_id, event_type, payload, status, attempt_count, next_retry_at, created_at, last_error
-		FROM webhook_events WHERE id = $1 AND tenant_id = $2`
-	ev, err := scanEventRow(q.QueryRowContext(ctx, query, eventID, tenantID))
-	if errors.Is(err, sql.ErrNoRows) {
+	job, err := r.queue.Get(ctx, q, tenantID, eventID)
+	if errors.Is(err, queue.ErrJobNotFound) {
 		return nil, ErrEventNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("webhook: get event: %w", err)
 	}
-	return ev, nil
+	return eventFromJob(job), nil
 }
 
 // MarkDelivered marks a successfully-delivered event terminal.
 func (r *Repository) MarkDelivered(ctx context.Context, q DBTX, eventID uuid.UUID) error {
-	const query = `UPDATE webhook_events SET status = 'delivered' WHERE id = $1`
-	if _, err := q.ExecContext(ctx, query, eventID); err != nil {
+	if err := r.queue.MarkDelivered(ctx, q, eventID); err != nil {
 		return fmt.Errorf("webhook: mark delivered: %w", err)
 	}
 	return nil
 }
 
 func (r *Repository) ScheduleRetry(ctx context.Context, q DBTX, eventID uuid.UUID, attemptCount int, nextRetryAt time.Time, lastError string) error {
-	const query = `
-		UPDATE webhook_events
-		SET status = 'pending', attempt_count = $2, next_retry_at = $3, last_error = $4
-		WHERE id = $1`
-	if _, err := q.ExecContext(ctx, query, eventID, attemptCount, nextRetryAt, lastError); err != nil {
+	if err := r.queue.ScheduleRetry(ctx, q, eventID, attemptCount, nextRetryAt, lastError); err != nil {
 		return fmt.Errorf("webhook: schedule retry: %w", err)
 	}
 	return nil
 }
 
-
 func (r *Repository) MoveToDeadLetter(ctx context.Context, tx *sql.Tx, ev *Event, lastError string) error {
-	const insertDL = `
-		INSERT INTO dead_letter_events (tenant_id, original_event_id, event_type, payload, attempt_count, last_error)
-		VALUES ($1, $2, $3, $4, $5, $6)`
-	if _, err := tx.ExecContext(ctx, insertDL,
-		ev.TenantID, ev.ID, ev.EventType, []byte(ev.Payload), ev.AttemptCount, lastError,
-	); err != nil {
-		return fmt.Errorf("webhook: insert dead letter event: %w", err)
-	}
-
-	const updateOriginal = `UPDATE webhook_events SET status = 'failed', last_error = $2 WHERE id = $1`
-	if _, err := tx.ExecContext(ctx, updateOriginal, ev.ID, lastError); err != nil {
-		return fmt.Errorf("webhook: mark original event failed: %w", err)
+	if err := r.queue.MoveToDeadLetter(ctx, tx, jobFromEvent(ev), lastError); err != nil {
+		return fmt.Errorf("webhook: move to dead letter: %w", err)
 	}
 	return nil
 }
 
-
+// EnqueueEvent satisfies ledger.EventEnqueuer -- see
+// internal/ledger/events.go for why ledger depends on a structurally-
+// matched interface it defines itself rather than importing this
+// package.
 func (r *Repository) EnqueueEvent(ctx context.Context, tx *sql.Tx, tenantID uuid.UUID, eventType string, payload json.RawMessage) error {
 	_, err := r.Enqueue(ctx, tx, tenantID, eventType, payload)
 	return err
 }
-
 
 func (r *Repository) GetTenantWebhookConfig(ctx context.Context, q DBTX, tenantID uuid.UUID) (url, secret string, err error) {
 	const query = `SELECT webhook_url, webhook_secret FROM tenants WHERE id = $1`
@@ -150,37 +119,30 @@ func (r *Repository) GetTenantWebhookConfig(ctx context.Context, q DBTX, tenantI
 	return nullURL.String, nullSecret.String, nil
 }
 
-func scanEvent(rows *sql.Rows) (*Event, error) {
-	var ev Event
-	var payload []byte
-	var lastError sql.NullString
-	if err := rows.Scan(
-		&ev.ID, &ev.TenantID, &ev.EventType, &payload, &ev.Status,
-		&ev.AttemptCount, &ev.NextRetryAt, &ev.CreatedAt, &lastError,
-	); err != nil {
-		return nil, fmt.Errorf("webhook: scan event: %w", err)
+func eventFromJob(job *queue.Job) *Event {
+	return &Event{
+		ID:           job.ID,
+		TenantID:     job.TenantID,
+		EventType:    job.JobType,
+		Payload:      job.Payload,
+		Status:       Status(job.Status),
+		AttemptCount: job.AttemptCount,
+		NextRetryAt:  job.NextRetryAt,
+		CreatedAt:    job.CreatedAt,
+		LastError:    job.LastError,
 	}
-	ev.Payload = payload
-	if lastError.Valid {
-		ev.LastError = &lastError.String
-	}
-	return &ev, nil
 }
 
-func scanEventRow(row *sql.Row) (*Event, error) {
-	var ev Event
-	var payload []byte
-	var lastError sql.NullString
-	err := row.Scan(
-		&ev.ID, &ev.TenantID, &ev.EventType, &payload, &ev.Status,
-		&ev.AttemptCount, &ev.NextRetryAt, &ev.CreatedAt, &lastError,
-	)
-	if err != nil {
-		return nil, err // sql.ErrNoRows bubbles up unwrapped for GetEvent's caller to translate
+func jobFromEvent(ev *Event) *queue.Job {
+	return &queue.Job{
+		ID:           ev.ID,
+		TenantID:     ev.TenantID,
+		JobType:      ev.EventType,
+		Payload:      ev.Payload,
+		Status:       queue.Status(ev.Status),
+		AttemptCount: ev.AttemptCount,
+		NextRetryAt:  ev.NextRetryAt,
+		CreatedAt:    ev.CreatedAt,
+		LastError:    ev.LastError,
 	}
-	ev.Payload = payload
-	if lastError.Valid {
-		ev.LastError = &lastError.String
-	}
-	return &ev, nil
 }

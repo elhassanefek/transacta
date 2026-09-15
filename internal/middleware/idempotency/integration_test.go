@@ -62,6 +62,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 
 	applyMigration(t, db, "000001_init.up.sql")
 	applyMigration(t, db, "000002_constraints.up.sql")
+	applyMigration(t, db, "000007_idempotency_response_body_text.up.sql")
 	return db
 }
 
@@ -232,12 +233,14 @@ func TestClaimOrGet_AbandonedProcessingClaimReclaimableAfterShortLease(t *testin
 	}
 }
 
-// TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim
-// proves the same scenario as its unit-test counterpart, but against real
-// Postgres: a stale writer's completion, carrying an outdated created_at
-// fencing token, must be refused once another server has reclaimed the
-// key -- not silently overwrite the newer claim's result.
-func TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim(t *testing.T) {
+// TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim_Integration
+// proves the same scenario as its unit-test counterpart in
+// middleware_test.go (same name, without the _Integration suffix), but
+// against real Postgres: a stale writer's completion, carrying an
+// outdated created_at fencing token, must be refused once another server
+// has reclaimed the key -- not silently overwrite the newer claim's
+// result.
+func TestComplete_FencingTokenPreventsStaleWriteFromClobberingNewerClaim_Integration(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 	repo := NewRepository(db)

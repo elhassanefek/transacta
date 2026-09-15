@@ -1,22 +1,40 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/elhassanefek/transacta/internal/audit"
 	"github.com/elhassanefek/transacta/internal/auth"
 	"github.com/elhassanefek/transacta/internal/ledger"
 	"github.com/elhassanefek/transacta/internal/tenants"
 )
 
-// --- Tenant API-key gate (Register only) ---
+// actorIDFromContext reads the authenticated user's ID from the JWT
+// claims the auth middleware put in context, for attribution on the
+// audit-trail row the ledger service records alongside the state
+// change. Empty when there's no authenticated user (shouldn't happen on
+// any route this is called from -- they all sit behind authmw.Middleware
+// -- but recording an empty actor_id is preferable to failing the
+// request over an audit-attribution gap).
+func actorIDFromContext(ctx context.Context) string {
+	claims, ok := auth.ClaimsFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return claims.UserID
+}
 
+// --- Tenant API-key gate (Register only) ---
 
 func requireTenantAPIKey(tenantRepo *tenants.Repository, db *sql.DB) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -196,7 +214,6 @@ type transferResponse struct {
 	Status        string `json:"status"`
 }
 
-
 func transferHandler(svc *ledger.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID, ok := tenants.FromContext(r.Context())
@@ -227,6 +244,7 @@ func transferHandler(svc *ledger.Service) http.HandlerFunc {
 		txn, _, err := svc.ExecuteTransfer(r.Context(), ledger.TransferRequest{
 			TenantID: tenantID,
 			Entries:  entries,
+			ActorID:  actorIDFromContext(r.Context()),
 		})
 		if err != nil {
 			writeTransferError(w, err)
@@ -289,7 +307,7 @@ func createAccountHandler(svc *ledger.Service) http.HandlerFunc {
 			return
 		}
 
-		account, err := svc.CreateAccount(r.Context(), tenantID, req.Name)
+		account, err := svc.CreateAccount(r.Context(), tenantID, req.Name, actorIDFromContext(r.Context()))
 		if err != nil {
 			writeTransferError(w, err)
 			return
@@ -410,6 +428,7 @@ func createPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
 		txn, _, err := svc.CreatePendingTransaction(r.Context(), ledger.TransferRequest{
 			TenantID: tenantID,
 			Entries:  entries,
+			ActorID:  actorIDFromContext(r.Context()),
 		})
 		if err != nil {
 			writeTransferError(w, err)
@@ -438,7 +457,7 @@ func postPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
 			return
 		}
 
-		txn, err := svc.PostPendingTransaction(r.Context(), tenantID, txnID)
+		txn, err := svc.PostPendingTransaction(r.Context(), tenantID, txnID, actorIDFromContext(r.Context()))
 		if err != nil {
 			writeTransferError(w, err)
 			return
@@ -466,7 +485,7 @@ func failPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
 			return
 		}
 
-		txn, err := svc.FailPendingTransaction(r.Context(), tenantID, txnID)
+		txn, err := svc.FailPendingTransaction(r.Context(), tenantID, txnID, actorIDFromContext(r.Context()))
 		if err != nil {
 			writeTransferError(w, err)
 			return
@@ -478,5 +497,57 @@ func failPendingTransactionHandler(svc *ledger.Service) http.HandlerFunc {
 			TransactionID: txn.ID.String(),
 			Status:        string(txn.Status),
 		})
+	}
+}
+
+// --- Audit log ---
+
+type auditEntryResponse struct {
+	ID        string          `json:"id"`
+	Action    string          `json:"action"`
+	ActorID   string          `json:"actor_id"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt string          `json:"created_at"`
+}
+
+// auditLogHandler lists the tenant's own audit trail, newest first.
+// Gated by the audit:read permission (admin only by default -- see
+// migrations/000006_audit_read_permission.up.sql) since it surfaces
+// every user's actions within the tenant, not just the caller's own.
+func auditLogHandler(repo *audit.Repository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := tenants.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no tenant in request context", http.StatusInternalServerError)
+			return
+		}
+
+		limit := 50
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				limit = n
+			}
+		}
+
+		entries, err := repo.List(r.Context(), tenantID, limit)
+		if err != nil {
+			http.Error(w, "failed to list audit log", http.StatusInternalServerError)
+			return
+		}
+
+		resp := make([]auditEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			resp = append(resp, auditEntryResponse{
+				ID:        e.ID.String(),
+				Action:    e.Action,
+				ActorID:   e.ActorID,
+				Payload:   e.Payload,
+				CreatedAt: e.CreatedAt.Format(time.RFC3339),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"entries": resp})
 	}
 }

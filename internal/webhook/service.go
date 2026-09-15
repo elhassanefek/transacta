@@ -81,14 +81,21 @@ func (s *Service) ProcessEvent(ctx context.Context, ev *Event) {
 	}
 
 	if errors.Is(deliverErr, ErrNoEndpointConfigured) {
-		// Nothing to retry toward -- leave it pending indefinitely
-		// rather than burning through attempts against a destination
-		// that doesn't exist. A future ScheduleRetry-based approach once
-		// the tenant configures a URL would need its own trigger; for
-		// now this just logs and moves on, matching the "not a delivery
-		// failure" framing in ErrNoEndpointConfigured's doc comment.
+		// Not a delivery failure, so it doesn't count against
+		// maxAttempts -- attemptCount is passed through unchanged. But
+		// ClaimPendingEvents already flipped this row to 'processing',
+		// and only 'pending' rows are ever reclaimed, so without
+		// explicitly resetting it here the event would be stuck in
+		// 'processing' forever, never picked up again even after the
+		// tenant configures a URL. ScheduleRetry both resets the status
+		// and pushes next_retry_at out by baseBackoff, so this doesn't
+		// get reclaimed and re-skipped on every single poll interval
+		// while the endpoint remains unconfigured.
 		metrics.WebhookSkippedNoEndpointTotal.Inc()
 		s.logger.Warn("webhook: no endpoint configured, skipping", "event_id", ev.ID, "tenant_id", ev.TenantID)
+		if err := s.repo.ScheduleRetry(ctx, s.repo.db, ev.ID, ev.AttemptCount, time.Now().Add(s.baseBackoff), deliverErr.Error()); err != nil {
+			s.logger.Error("webhook: failed to reset unconfigured event to pending", "event_id", ev.ID, "error", err)
+		}
 		return
 	}
 

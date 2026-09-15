@@ -66,7 +66,7 @@ jobs:
           DB_NAME: transacta
           DB_SSLMODE: disable
 
-        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -tags=integration -v -race -covermode=atomic -coverprofile=coverage.out ./...
 
   docker-build:
     name: Verify Docker Image Build
